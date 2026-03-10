@@ -1,0 +1,6 @@
+{
+  "api_provider": "自定义API",
+  "custom_api_key": "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",
+  "custom_api_base_url": "https://integrate.api.nvidia.com/v1",
+  "custom_api_model_name": "openai/gpt-oss-120b"
+}

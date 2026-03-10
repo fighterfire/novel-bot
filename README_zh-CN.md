@@ -1,0 +1,155 @@
+# Novel Bot
+
+[English Docs](README.md)
+
+这是一个吸收了智能小说写作 Agent。它采用 "Filesystem as Memory"（文件即记忆）的设计理念，通过持续的 Agent Loop 与用户交互，能够维护长篇小说的连贯性。
+
+## 核心特性
+
+- **Agent 架构**：不再是线性的脚本，而是一个会思考、会自省的持续运行进程。
+- **文件即数据库**：所有的记忆（Memory）、人设（Soul）、设定（World）都以 Markdown 文件直接存储在 `workspace/` 中，方便用户随时人工干预和修改。
+- **AI 自动生成设定**：支持根据写作需求自动生成小说的核心设定文件（SOUL.md, USER.md, TONE.md, CHARACTERS.md, WORLD.md, STORY_SUMMARY.md），快速搭建小说框架。
+- **双重记忆系统**：
+    - **长期记忆 (Global Memory)**：记录世界观变迁、重要剧情节点 (`memory/MEMORY.md`)。
+    - **短期记忆 (Chapter Memory)**：记录最近章节的详细摘要 (`memory/chapters/`)，防止上下文超长。
+- **OpenAI 兼容性**：支持兼容 OpenAI 接口的模型。
+
+## 部署安装
+
+### 1. 环境准备
+
+确保你的 Python 版本 >= 3.10。
+
+```bash
+git clone https://github.com/xiaoxiaoxiaotao/novel-bot.git
+cd novel-bot
+```
+
+### 2. 安装依赖
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+### 3. 配置模型
+
+在项目根目录创建 `.env` 文件，填入你的 API Key 和 Base URL（可以参考.env.example文件）。
+
+作者使用的是[Try NVIDIA NIM APIs](https://build.nvidia.com/)上的api，采用的moonshotai/kimi-k2.5模型。
+
+```env
+NVIDIA_API_KEY=your_nvidia_api_key_here
+NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
+MODEL_NAME=moonshotai/kimi-k2.5
+```
+
+## 使用方法
+
+### 1. 初始化工作区
+
+首次运行时，需要初始化工作区。这将创建 `workspace` 目录和必要的设定文件（SOUL.md, WORLD.md 等）。
+
+**基本用法（使用默认模板）：**
+```bash
+python -m novel_bot init
+```
+
+**根据写作需求自动生成设定文件：**
+```bash
+python -m novel_bot init --prompt "我想写一部关于末日丧尸视角下的故事，人类可以觉醒异能，主角是一个在末日中挣扎求生的普通人"
+```
+
+**指定工作区路径：**
+```bash
+python -m novel_bot init --path "my_workspace"
+```
+
+**覆盖已存在的设定文件：**
+```bash
+python -m novel_bot init --prompt "你的写作需求" --overwrite
+```
+
+*提示：你可以直接编辑 `workspace/` 下的 Markdown 文件来修改 AI 的人设或小说的大纲。*
+
+**命令行参数说明：**
+- `--path`：指定工作区路径（默认：workspace）
+- `--prompt` / `-p`：输入写作需求，AI会自动生成设定文件
+- `--overwrite` / `-o`：覆盖已存在的设定文件
+- `--auto` / `-a`：如果工作区已存在，自动创建新工作区（如 workspace_1, workspace_2）
+
+### 多项目写作
+
+如果你需要同时进行多个小说项目的写作，可以使用 `--auto` 参数自动创建新的工作区：
+
+**创建第一个项目：**
+```bash
+python -m novel_bot init --auto --prompt "我想写一部关于末日丧尸视角下的故事"
+```
+这将创建 `workspace` 目录。
+
+**创建第二个项目：**
+```bash
+python -m novel_bot init --auto --prompt "我想写一部关于仙侠修真的故事"
+```
+这将自动创建 `workspace_1` 目录。
+
+**创建第三个项目：**
+```bash
+python -m novel_bot init --auto --prompt "我想写一部关于科幻星际的故事"
+```
+这将自动创建 `workspace_2` 目录。
+
+**启动指定项目：**
+```bash
+python -m novel_bot start --workspace workspace_1
+```
+
+这样你就可以在不同的工作区中维护多个独立的小说项目，每个项目都有自己的设定文件、草稿和记忆系统。
+
+### 2. 启动 Agent
+
+启动交互式写作界面：
+
+```bash
+python -m novel_bot start
+```
+
+### 3. 交互示例
+
+在终端中作为 "Editor" (编辑) 指挥 Agent 写作：
+
+```text
+Editor > 我想撰写一个末日丧尸视角下的故事，人类可以觉醒异能，请你为小说撰写一些人物、风格、情节的设定，生成世界观和大纲。
+
+Thinking...
+Agent: [生成了...]
+
+Editor > 很好，现在开始写第一章的正文，注意描写环境的阴冷。
+
+Thinking...
+Agent: [生成正文并保存到文件]
+```
+
+## 目录结构
+
+```text
+novel_bot/          # 核心代码
+  agent/            # Agent 逻辑 (Loop, Memory, Tools)
+  cli/              # 命令行入口
+  config/           # 配置加载
+workspace/          # [自动生成] 小说的数据存储位置 (Git 忽略)
+  drafts/           # 小说正文草稿 (e.g. drafts/chapter_01.md)
+  SOUL.md           # AI 的人设/写作风格
+  USER.md           # 用户的写作目标和需求
+  TONE.md           # 小说的基调、风格和叙事特点
+  CHARACTERS.md     # 角色卡
+  WORLD.md          # 世界观设定
+  STORY_SUMMARY.md  # 全书剧情梗概
+  memory/           # 自动管理的记忆系统
+    chapters/       # 章节记忆
+```
+
+## 致谢
+
+- 本项目的部分代码参考和借鉴了 [nanobot](https://github.com/HKUDS/nanobot.git) 项目。
+

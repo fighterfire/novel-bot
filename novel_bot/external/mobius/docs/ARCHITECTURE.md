@@ -1,0 +1,1282 @@
+# Mobius 架构文档（v3.0）
+
+> 本文档描述当前主流程架构（v3.0）。  
+> v2.x 的双循环正文直生成为历史设计，不再作为 CLI 主入口。
+
+---
+
+## 1. 版本定位
+
+v3.0 的核心目标是解决长篇小说生成中的两类问题：
+
+- 主线停滞：章节之间重复迭代，不产生实质推进
+- 上下文失控：从粗概要直接扩 5000 字，容易写飞或违背设定
+
+为此，Mobius 采用 **三层创作架构**（工程上拆成四个顺序阶段）：
+
+1. 章节概要（Outline）
+2. 设定集反向补完（Setting Pack）
+3. 章节分镜（Storyboard）
+4. 分镜驱动扩写（Expand）
+
+并在前 3 个阶段加入人工审批闸门。
+
+---
+
+## 2. 三层主流程
+
+### 2.1 流程图
+
+```mermaid
+flowchart TD
+  inputYaml[PresetYaml] --> outlineGen[Layer1B_Outline]
+  outlineGen --> approveOutline[ApproveOutline]
+  approveOutline --> settingPack[Layer1A_SettingPack_Backfill]
+  settingPack --> approveSetting[ApproveSetting]
+  approveOutline --> storyboardGen[Layer2_Storyboard]
+  approveSetting --> storyboardGen
+  storyboardGen --> approveStoryboard[ApproveStoryboard]
+  approveStoryboard --> expandGen[Layer3_ExpandByStoryboard]
+  expandGen --> chapterGate[ChapterQualityGate]
+  chapterGate --> chaptersOut[ChaptersOutput]
+  chaptersOut --> fullNovel[FullNovelMd]
+```
+
+### 2.2 每层职责
+
+- `Layer1B Outline`：先按章定义主线职责、不可逆变化、线索回收与新承诺
+- `Layer1A SettingPack`：再基于已确认概要反向补完设定（人物出场时机/世界规则深描/结构化时间线）
+- `Layer2 Storyboard`：把每章概要拆成 4-8 个场景，并强制加入降密场景
+- `Layer3 Expand`：严格按分镜扩写正文，不允许“概要直扩”
+
+---
+
+## 3. 阶段闸门与约束
+
+### 3.1 人工审批闸门
+
+扩写前必须满足三个审批文件全部存在且 `approved=true`：
+
+- `setting_approval.json`
+- `outline_approval.json`
+- `storyboard_approval.json`
+
+缺任何一个都阻断 `expand`。
+
+### 3.2 分镜约束（Layer2）
+
+每章分镜要求：
+
+- 场景数 4-8
+- 至少 2 个 `plot_progress` 场景
+- 至少 1 个降密场景：`daily` / `silence` / `narration`
+- 场景必须有因果链（`causal_from -> causal_to`）
+
+### 3.3 扩写质量闸门（Layer3）
+
+每章扩写完成后执行质量检查：
+
+- 不可逆推进是否命中
+- 线索回收是否命中（至少部分）
+- 是否触发硬约束冲突（规则匹配）
+- 场景覆盖率是否达标（当前阈值 50%）
+- 与 `SettingPack` 设定锚点关联是否过弱
+
+失败策略：
+
+- 单章最多重写 1 次
+- 仍失败则降级放行并记录 warning（不中断全流程）
+
+---
+
+## 4. 核心数据模型
+
+### 4.1 新增模型（v3.0）
+
+文件：`src/mobius/models/chapter.py`
+
+- `SettingEntity`
+  - `name`, `category`, `description`
+  - `constraints`, `unresolved_questions`
+- `SettingCharacterProfile`
+  - `name`, `role`, `personality_traits`, `inner_thinking_habits`
+  - `outfit_style`, `first_appearance_chapter`, `first_appearance_moment`
+  - `first_appearance_constraints`, `arc_seed`
+- `SettingRule`
+  - `rule_id`, `statement`, `rationale`, `forbidden_cases`
+- `TimelineEvent`
+  - `event_id`, `title`, `description`, `chapter_hint`, `dependencies`, `irreversible_impact`
+- `SettingPack`
+  - `title`, `theme`, `theme_longform`, `worldview_longform`
+  - `worldview_rules`, `detailed_rules`
+  - `core_events_timeline`, `timeline_events`
+  - `characters`, `organizations`, `items`, `entities`
+  - `missing_items`, `author_notes`
+- `StoryboardScene`
+  - `scene_index`, `scene_type`, `title`, `objective`
+  - `conflict_type`, `location`, `participating_characters`
+  - `causal_from`, `causal_to`, `info_gain`, `style_notes`, `expected_beats`
+- `ChapterStoryboard`
+  - `chapter_index`, `title`, `purpose`
+  - `irreversible_change`, `must_payoffs`
+  - `scenes`
+
+### 4.2 状态字段扩展（NovelState）
+
+文件：`src/mobius/state/novel_state.py`
+
+新增字段：
+
+- `setting_pack: SettingPack | None`
+- `setting_approved: bool`
+- `chapter_outlines: list[ChapterOutline]`
+- `outline_approved: bool`
+- `chapter_storyboards: list[ChapterStoryboard]`
+- `storyboard_approved: bool`
+- `global_guardrails: list[str]`
+
+---
+
+## 5. 图编排与节点
+
+文件：`src/mobius/graph/novel_graph.py`
+
+### 5.1 图构建器（v3.0）
+
+- `build_setting_pack_graph` / `compile_setting_pack_graph`
+- `build_outline_graph` / `compile_outline_graph`
+- `build_storyboard_graph` / `compile_storyboard_graph`
+- `build_expand_graph` / `compile_expand_graph`
+
+### 5.2 关键节点
+
+- 设定层
+  - `generate_setting_pack`
+  - `persist_setting_pack`
+- 概要层
+  - `blueprint_refresh`
+  - `generate_outlines`
+  - `persist_outlines`
+- 分镜层
+  - `generate_storyboards`
+  - `persist_storyboards`
+- 扩写层
+  - `expand_storyboard_chapter`
+  - `storyboard_quality_gate`
+  - `persist_expand_chapter`
+
+### 5.3 路由动作
+
+文件：`src/mobius/graph/routing.py`
+
+`VALID_ACTIONS` 已包含 v3.0 新动作：
+
+- `generate_setting_pack`, `persist_setting_pack`
+- `generate_outlines`, `persist_outlines`
+- `generate_storyboards`, `persist_storyboards`
+- `expand_storyboard_chapter`, `storyboard_quality_gate`, `persist_expand_chapter`
+
+---
+
+## 6. Agent 职责映射
+
+### 6.1 Director（规划侧）
+
+文件：`src/mobius/agents/director.py`
+
+- `create_generate_setting_pack_node`
+- `create_generate_outlines_node`（`setting_pack` 可选）
+- `create_generate_storyboards_node`
+
+### 6.2 Narrator（扩写侧）
+
+文件：`src/mobius/agents/narrator.py`
+
+- `create_expand_storyboard_chapter_node`
+  - 输入：`ChapterStoryboard + SettingPack 摘要 + guardrails`
+  - 输出：单章正文（字数下限受 `chapter_min_words` 控制）
+
+---
+
+## 7. 输出目录规范（v3.0）
+
+由 `OutputManager` 管理，文件：`src/mobius/output/manager.py`
+
+```text
+output/<novel_name>/
+├── setting_pack/
+│   ├── setting_pack.json
+│   ├── setting_pack.md
+│   ├── theme.md
+│   ├── worldview.md
+│   ├── timeline.md
+│   ├── characters.md
+│   ├── organizations.md
+│   └── items.md
+├── outlines/
+│   ├── chapter_001_outline.json
+│   └── chapter_001.md
+├── full_outline.md
+├── storyboards/
+│   ├── chapter_001_storyboard.json
+│   └── chapter_001.md
+├── full_storyboard.md
+├── chapters/
+│   └── chapter_001.md
+├── full_novel.md
+├── setting_approval.json
+├── outline_approval.json
+├── storyboard_approval.json
+└── metadata.json
+```
+
+保留历史目录（事件/评审/记忆/状态）以兼容已有工具链：
+
+- `events/`, `reviews/`, `memory/`, `state/`
+
+---
+
+## 8. CLI 命令（v3.0）
+
+入口文件：`src/mobius/main.py`
+
+### 8.1 主命令集
+
+- `mobius outline <setting.(yaml|md)> -o <output> [--end-chapter N]`
+- `mobius approve-outline -o <output>`
+- `mobius setting-pack <setting.(yaml|md)> -o <output>`
+- `mobius approve-setting -o <output>`
+- `mobius storyboard <setting.(yaml|md)> -o <output> [--from-outline <dir>]`
+- `mobius approve-storyboard -o <output>`
+- `mobius expand <setting.(yaml|md)> -o <output> [--from-storyboard <dir>] [--start-chapter N] [--end-chapter N]`
+
+说明：当输入为 `.md` 启动文档时，CLI 会自动在 `output/<name>/bootstrap/` 生成或复用 `*.preset.yaml`，再驱动后续流程。
+
+### 8.2 Dry-run 模式
+
+用于离线链路验证（不依赖在线模型）：
+
+- `setting-pack --dry-run`
+- `outline --dry-run`
+- `storyboard --dry-run`
+- `expand --dry-run`
+
+说明：`--dry-run` 产物用于流程调试，不代表最终文学质量。
+
+---
+
+## 9. 提示词体系（v3.0）
+
+目录：`src/mobius/prompts/`
+
+新增提示词：
+
+- `director_setting_pack_system.txt`
+- `director_setting_pack_schema.txt`
+- `director_storyboard_system.txt`
+- `director_storyboard_schema.txt`
+
+扩写提示词沿用分镜扩写路径：
+
+- `narrator_expand_outline_system.txt`（当前内容已用于分镜扩写节点）
+- `narrator_expand_outline_instructions.txt`
+
+> 后续建议重命名为 `narrator_expand_storyboard_*`，以避免语义歧义。
+
+---
+
+## 10. 失败恢复与运行策略
+
+### 10.1 网络波动
+
+在线模型可能出现：
+
+- `Server disconnected without sending a response`
+
+推荐恢复方式：
+
+- 缩小批次（例如 `outline --end-chapter 3`）
+- 用 `expand --start-chapter N --end-chapter M` 分段续跑
+
+### 10.2 断点续跑
+
+v3.0 扩写阶段天然支持按章节区间续跑（基于 `start/end chapter`），避免整批重跑。
+
+---
+
+## 11. 与 v2.x 的主要差异
+
+- 从“正文中心”改为“资产中心”
+- 从两阶段（概要->扩写）改为三层（设定->概要->分镜->扩写）
+- 新增三重人工审批闸门
+- 扩写输入从概要变为分镜，降低写飞风险
+- 质量闸门从轻量文本规则升级为“推进+设定+覆盖”复合检查
+- CLI 主入口切换到 v3.0 命令集
+
+---
+
+## 12. 后续演进建议（v3.1+）
+
+- 将扩写提示词命名统一到 `storyboard` 语义
+- 引入分镜覆盖率的语义匹配（embedding）替代关键词命中
+- 对质量闸门失败原因做结构化日志落盘（便于评估）
+- 增加 `assemble` 命令：显式按 `chapters/` 重建 `full_novel.md`
+
+---
+
+## 13. 参考实现入口
+
+- CLI：`src/mobius/main.py`
+- 图编排：`src/mobius/graph/novel_graph.py`
+- 路由：`src/mobius/graph/routing.py`
+- Director：`src/mobius/agents/director.py`
+- Narrator：`src/mobius/agents/narrator.py`
+- OutputManager：`src/mobius/output/manager.py`
+- State：`src/mobius/state/novel_state.py`
+- Models：`src/mobius/models/chapter.py`
+
+# Mobius — AI 小说创作多智能体系统
+
+> **版本**: v2.1（失控型叙事引擎）🔥
+> **定位**: 让角色带着偏见做错事，让世界自行失控，让故事自然崩坏。
+
+## 🔥 v2.2 核心进化：文风冷却与张弛结构
+
+在 v2.1 "失控型叙事引擎" 的基础上，Mobius 引入了更深层的文风管控机制，旨在从根本上解决 AI 创作中常见的"文字过热"、"句句用力"和"哲学化自觉"等问题。
+
+### 核心理念：从"持续高潮"到"有呼吸感"
+
+**目标**：不再追求每一句都漂亮，而是允许平庸、允许冷场、允许失误、允许空白。
+
+### 新增核心机制
+
+1. **文风控制器 (Style Governor)**: 独立的后处理层，强制执行比喻密度限制、抽象词压缩和普通句比例。
+2. **张弛算法 (Rhythm Engine)**: 循环节奏控制（高张力 -> 冷却 -> 日常 -> 意外 -> 沉默 -> 再爆发），强制在情绪爆发后插入低能量段。
+3. **角色失误模块 (Human Error Engine)**: 强制角色每 2 章犯一个非战略性错误（误判、失控、撒谎），并产生不可逆的真实后果。
+4. **漂亮话删减策略**: 自动识别并删掉章节中读着最“爽”、最华丽的 20% 句子，保留骨架，制造张力。
+
+---
+
+## 目录
+
+1. [系统目标](#1-系统目标)
+2. [设计哲学](#2-设计哲学)
+3. [产品架构](#3-产品架构)
+4. [技术架构](#4-技术架构)
+5. [双循环流水线](#5-双循环流水线)
+6. [核心子系统详解](#6-核心子系统详解)
+7. [数据模型全览](#7-数据模型全览)
+8. [Agent 全览](#8-agent-all-view)
+9. [LLM 抽象层](#9-llm-抽象层)
+10. [状态管理](#10-状态管理)
+11. [YAML 设定集规范](#11-yaml-设定集规范)
+12. [项目结构](#12-项目结构)
+13. [使用方式](#13-使用方式)
+14. [扩展指南](#14-扩展指南)
+15. [附录：失控型叙事引擎 (v2.x)](#68-失控型叙事引擎-chaos-engine-v21)
+
+---
+
+## 1. 系统目标
+
+### 1.1 核心愿景
+
+**让角色拥有灵魂，让世界自行演化，让故事自然发生。**
+
+传统的 AI 写作工具是"剧本驱动"——AI 按照人类给定的大纲逐段生成文字。Mobius 的设计目标是从根本上颠覆这个范式：
+
+| 维度 | 传统 AI 写作 | Mobius |
+|------|------------|--------|
+| 剧情来源 | 大纲 → 章节 → 段落 | 角色欲望碰撞 → 冲突自然产生 |
+| 角色定位 | 按剧本演出的演员 | 拥有独立信念和欲望的自治体 |
+| 世界观 | 静态背景板 | 带有物理状态总线的动态环境 |
+| 叙事视角 | 单一全知视角 | 多视角交叉（主线 + 支线观察者） |
+| 角色成长 | 属性数值变化 | 信念层级重排（核心信念崩解 = 人物重大转折） |
+| 质量控制 | 无 | 主题守护 + 张力控制 + 自我批评三合一评审 |
+
+### 1.2 具体能力
+
+- **世界模拟层**: 角色在没有剧情推动时也会"思考"，拥有自己的长期目标，在无人观察时也会发生变化
+- **欲望驱动叙事**: 冲突 = 欲望相撞，只要欲望图存在，故事就会自然发生
+- **资源经济**: 行动有成本，决策 = 有限资源下的选择
+- **信念演化**: 角色成长 = 信念层级重排，而非简单的属性数值变化
+- **认知黑箱**: 角色生成私有内心独白后再生成外显行为，产生"言不由衷"的文学深度
+- **环境互动**: 物理状态总线（如"警报等级"、"算力余量"）直接影响角色决策
+- **多视角叙事**: 系统日志、路人、残留数据片段等非主角视角增加叙事空间感
+- **自我进化**: 章节评审机制确保主题不漂移、节奏有张力、逻辑不崩塌
+
+---
+
+## 2. 设计哲学
+
+### 2.1 五大原则
+
+**原则一：世界先于故事**
+
+世界是持续运转的模拟，故事是从中"裁剪"出来的。World Observer Agent 只选择高叙事价值的事件写入小说，但世界本身不会因为"不好看"而停止运行。裁剪 ≠ 干预。
+
+**原则二：欲望驱动，而非剧本驱动**
+
+导演（Director）的角色从"剧本作者"变为"编排者"。他不凭空创造冲突，而是从观察者标记的高价值世界事件中选择素材，再用角色的欲望提案来组织场景。
+
+**原则三：行动有代价**
+
+引入六维资源系统（时间、声誉、权力、信息、情绪能量、财富）。角色的每次决策都是在有限资源下的选择。当情绪能量耗尽，角色不再理性；当声誉归零，角色失去社会资源。这让叙事有了"重量"。
+
+**原则四：信念不是标签**
+
+角色不是用一组形容词定义的。三层信念系统（core → middle → surface）让角色可以：
+- 自我怀疑
+- 推翻旧信念
+- 形成新的行为模式
+
+当 core 信念的强度降至 0.2 以下时会"崩解"为 middle 层——这是角色的人格地震，也是小说中最珍贵的转折点。
+
+**原则五：思维质感差异化**
+
+不同角色可以使用不同的模型和参数。结构化决策（信念变更计算）用 Gemini，角色扮演对话和内心活动用 MiniMax M2-her。这让角色的"思维方式"真正不同，而非仅仅是"人格模板切换"。
+
+### 2.2 认知黑箱机制
+
+灵感来源：现实中人们从来不是"直言不讳"的。每个人在开口前都有一个内部审查过程。
+
+Mobius 的角色 Agent 采用两阶段生成：
+
+```
+Stage 1（私有）: "写出你此刻真实的内心独白——恐惧、真实想法、不可告人的动机。"
+                  → internal_monologue（不向其他角色公开）
+
+Stage 2（外显）: "你的真实想法是 {monologue}，但你现在必须在他人面前行动。
+                  你实际上会说什么、做什么？注意——你不一定要说出真心话。"
+                  → content（其他角色和读者看到的）
+```
+
+关键规则：
+- 角色 A 的 `internal_monologue` **不会**进入角色 B 的 context
+- 但叙事 Agent **可以看到**所有角色的 `internal_monologue`
+- 叙事 Agent 用微表情、环境描写、语气词等文学手法**暗示**潜台词，而非直白说出
+
+这产生了"言不由衷"的效果——林晚晴嘴上在赶苏薇走，但读者能从细微的描写中感受到她的真实想法是"我不能让你牵扯进来"。
+
+---
+
+## 3. 产品架构
+
+### 3.1 四层架构图
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Meta / Observation Layer                   │
+│  ┌──────────────┐ ┌──────────────┐ ┌──────────────────────┐ │
+│  │ World        │ │ Theme        │ │ Self-Critique +      │ │
+│  │ Observer     │ │ Guardian     │ │ Tension Controller   │ │
+│  │ + Secondary  │ │              │ │ (Reviewer Agent)     │ │
+│  │ Viewpoints   │ │              │ │                      │ │
+│  └──────┬───────┘ └──────┬───────┘ └──────────┬───────────┘ │
+│         │                │                     │             │
+├─────────┼────────────────┼─────────────────────┼─────────────┤
+│         │     Orchestration Layer               │             │
+│  ┌──────▼───────┐ ┌──────▼───────┐ ┌──────────▼───────────┐ │
+│  │ Director /   │ │ Memory       │ │ Environment Engine   │ │
+│  │ Orchestrator │ │ Distiller    │ │ (Physical State Bus) │ │
+│  └──────┬───────┘ └──────────────┘ └──────────┬───────────┘ │
+│         │                                      │             │
+├─────────┼──────────────────────────────────────┼─────────────┤
+│         │     World Simulation Layer            │             │
+│  ┌──────▼───────┐              ┌───────────────▼───────────┐ │
+│  │ Conflict     │              │ Resource Economy          │ │
+│  │ Engine       │              │                           │ │
+│  └──────┬───────┘              └───────────────────────────┘ │
+│         │                                                     │
+├─────────┼─────────────────────────────────────────────────────┤
+│         │     Character Layer (M2-her Powered)                │
+│  ┌──────▼───────┐ ┌──────────────┐ ┌──────────────────────┐ │
+│  │ Character A  │ │ Character B  │ │ Character N          │ │
+│  │ Stage1: Mono │ │ Stage1: Mono │ │ Stage1: Monologue    │ │
+│  │ Stage2: Act  │ │ Stage2: Act  │ │ Stage2: Action       │ │
+│  │ ┌──────────┐ │ │              │ │                      │ │
+│  │ │ Belief   │ │ │              │ │                      │ │
+│  │ │ Desire   │ │ │              │ │                      │ │
+│  │ │ Fear     │ │ │              │ │                      │ │
+│  │ │ Resource │ │ │              │ │                      │ │
+│  │ │ Memory   │ │ │              │ │                      │ │
+│  │ └──────────┘ │ │              │ │                      │ │
+│  └──────────────┘ └──────────────┘ └──────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 3.2 用户交互界面
+
+Mobius 通过 CLI 与用户交互，支持两种模式：
+
+- **批量模式** (`mobius generate setting.yaml`): 一次性生成完整小说
+- **交互模式** (`mobius generate setting.yaml -i`): 逐章生成，用户可在章节间查看角色状态、决定是否继续
+
+---
+
+## 4. 技术架构
+
+### 4.1 技术栈
+
+| 层级 | 技术选型 | 说明 |
+|------|---------|------|
+| 编排框架 | **LangGraph** (StateGraph) | 有状态的多 Agent 工作流，支持条件路由和 Checkpoint |
+| 数据模型 | **Pydantic v2** | 严格的类型验证，确保 Agent 间数据传递的正确性 |
+| LLM 推理 | **Gemini 3 Flash** (默认) | 结构化决策、JSON 生成、章节规划 |
+| 角色扮演 | **MiniMax M2-her** (可选) | 深度角色扮演，独有的 user_system/sample_message 角色 |
+| LLM 抽象 | **LangChain Core** | BaseChatModel 统一接口，支持多 Provider |
+| 状态持久化 | **InMemorySaver** | LangGraph 内置 Checkpointer |
+| CLI | **Rich** + argparse | 美观的终端输出和进度展示 |
+| 配置 | **PyYAML** | 人类可读的设定集文件 |
+
+### 4.2 依赖关系
+
+```
+pyproject.toml:
+  langgraph >= 0.4
+  langchain-core >= 0.3
+  langchain-openai >= 0.3        # OpenAI 兼容
+  langchain-google-genai >= 2.0  # Google Gemini
+  httpx >= 0.27                  # MiniMax API 调用
+  pydantic >= 2.0
+  pyyaml >= 6.0
+  rich >= 13.0
+```
+
+---
+
+## 5. 双循环流水线
+
+Mobius 采用**双循环架构**，将"世界模拟"和"叙事呈现"解耦，并新增“全书架构层”保证整体性：
+
+```
+                    ┌────────────────────────────────────────────────┐
+                    │         Inner Loop: World Simulation            │
+                    │                                                │
+                    │  env_update ──► desire_tick ──► conflict_detect │
+                    │       ▲                              │         │
+                    │       │                              ▼         │
+                    │  clue_ledger ◄── ... ◄── observer_mark         │
+                    │       │                              │         │
+                    └───────┼──────────────────────────────┼─────────┘
+                            │                              │
+                    ┌───────┼──────────────────────────────┼─────────┐
+                    │       │   Outer Loop: Narrative       │         │
+                    │       │                              ▼         │
+                    │  distill_memory   blueprint_refresh ◄───┘      │
+                    │       ▲                 │                      │
+                    │       │                 ▼                      │
+                    │  review_chapter     plan_chapter               │
+                    │       ▲                 │                      │
+                    │       │                 ▼                      │
+                    │  (viewpoints)   chapter_contract               │
+                    │       ▲          (action/interact)             │
+                    │       │                 │                      │
+                    │  compile_chapter ◄── direct_scene ◄────────────┘
+                    │                                                │
+                    └────────────────────────────────────────────────┘
+```
+
+### 5.1 内循环：世界模拟
+
+每章开始前执行，模拟世界的自然运转：
+
+| 步骤 | 节点 | 职责 |
+|------|------|------|
+| 1 | `env_update` | 环境变量按 decay_rate 自然衰减；角色资源按 recovery_rate 回复 |
+| 2 | `desire_tick` | 每个角色根据欲望优先级和资源状况提出行动提案 (DesireProposal) |
+| 3 | `conflict_detect` | 冲突引擎检测欲望碰撞、资源争夺、恐惧触发，生成 WorldEvent |
+| 4 | `observer_mark` | 世界观察者用 LLM 评估每个事件的叙事价值，选出高价值事件 |
+| 5 | `blueprint_refresh` | 建立/刷新全书蓝图（主命题、反命题、综合、章节职责、角色弧线） |
+
+### 5.2 外循环：叙事呈现
+
+从观察者标记的素材中编排和呈现：
+
+| 步骤 | 节点 | 职责 |
+|------|------|------|
+| 6 | `plan_chapter` | 生成章节规划（含 chapter_purpose/theme_move/payoff/promise） |
+| 7 | `chapter_contract` | 章节合同校验，不通过则回退重规划 |
+| 8 | `direct_scene` | 从场景队列取出下一个场景，根据类型路由 |
+| 9 | `character_action` / `character_interact` | 角色执行双阶段生成（内心独白 → 外显行动） |
+| 10 | `update_state` | 应用信念/资源/情感/环境变化，检查触发条件 |
+| 11 | `check_triggers` → `handle_trigger` | 处理触发事件 |
+| 12 | `compile_chapter` | 叙事 Agent 融合外显行为 + 潜台词 + 支线视角 → 小说正文 |
+| 13 | `secondary_viewpoints` | 支线观察者生成非主角视角片段 |
+| 14 | `review_chapter` | 评审 Agent 输出主题/张力/结构一致性指标 |
+| 15 | `distill_memory` | 记忆蒸馏 Agent 将旧记忆压缩为结构化摘要 |
+| 16 | `clue_ledger` | 线索账本结算（开线/回收/逾期）并路由下一章或结束 |
+
+循环回到步骤 1 开始下一章，直到所有章节完成。
+
+### 5.3 三层导演（Series Architect / Chapter Contract / Scene Orchestrator）
+
+为避免“单场景好看但全书松散”，导演被拆为三层协作：
+
+1. **Series Architect（全书架构师）**  
+   节点：`blueprint_refresh`  
+   产出：`NovelBlueprint`（主命题/反命题/综合立场、章节职责、角色哲学弧线）
+
+2. **Chapter Contract Planner（章节合同层）**  
+   节点：`plan_chapter` + `chapter_contract`  
+   产出：`ChapterPlan` + `ChapterContract`（`chapter_purpose`、`theme_move`、`required_payoffs`、`new_promises`、`philosophical_beat`）  
+   机制：合同校验失败时回退 `plan_chapter` 重规划，保证结构约束先于场景执行
+
+3. **Scene Orchestrator（场景编排层）**  
+   节点：`direct_scene`  
+   执行：逐场景路由与调度，场景级字段明确因果与命题信号（`causal_from`、`causal_to`、`thesis_signal`、`thread_ops`）
+
+---
+
+## 6. 核心子系统详解
+
+### 6.1 信念系统 (Belief System)
+
+```python
+class Belief:
+    id: str               # 唯一标识
+    statement: str         # "掌控一切才能保护所爱的人"
+    layer: str             # "core" | "middle" | "surface"
+    strength: float        # 0.0 - 1.0
+    category: str          # "价值观" | "世界认知" | "行为策略"
+```
+
+**三层结构**：
+
+| 层级 | 抗变系数 | 说明 | 示例 |
+|------|---------|------|------|
+| core | 0.3 (仅接受 30% 变化) | 人格基石，极难改变 | "人性本善" |
+| middle | 0.7 | 可被剧情动摇 | "AI不应拥有情感" |
+| surface | 1.0 | 行为策略，动态更新 | "先观察再行动" |
+
+**信念演化事件**：
+- **固化**：当 surface 信念强度 ≥ 0.95 时，升级为 middle 层
+- **崩解**：当 core 信念强度 ≤ 0.2 时，降级为 middle 层 ← **这是小说中最珍贵的转折点**
+
+### 6.2 欲望驱动系统 (Desire Engine)
+
+```python
+class Desire:
+    id: str
+    description: str           # "找到并拯救陆辰"
+    priority: float            # 0.0-1.0，动态调整
+    category: str              # survival | belonging | power | self_actualization
+    required_resources: dict   # {"time": 10, "reputation": -20}
+    conflicts_with: list[str]  # 与哪些其他角色的欲望冲突
+
+class Fear:
+    id: str
+    description: str           # "害怕失去对陆辰的控制"
+    intensity: float           # 0.0-1.0
+    linked_desire: str         # 恐惧往往是欲望的反面
+    avoidance_cost: float      # 为逃避恐惧愿意付出的资源代价
+```
+
+**工作流**：每章开始时，每个角色根据自身的欲望排序和资源状况提出 `DesireProposal`（行动提案）。冲突引擎自动检测：
+1. **欲望碰撞**：两个角色想要互斥的东西
+2. **资源枯竭**：某资源曾为正且现 ≤10 时报告（`val<=0` 如 power=0 不报告，避免噪音）
+3. **恐惧触发**：某角色的行动恰好触发另一角色的恐惧
+
+这些冲突自动成为世界事件，被观察者评估并可能被选入小说。
+
+### 6.3 资源系统 (Resource Economy)
+
+```python
+class ResourcePool:
+    time: float              # 时间精力 (每章消耗、自然回复)
+    reputation: float        # 社会声誉 (影响可调动的社会关系)
+    power: float             # 权力/影响力
+    information: float       # 信息量 (信息不对称的核心)
+    emotional_energy: float  # 情绪能量 (过低 → 崩溃/冲动)
+    wealth: float            # 经济资源
+    custom: dict             # 自定义维度（如 "算力"）
+```
+
+**资源枯竭效应**：
+- `emotional_energy ≤ 20`: 角色不再理性决策，做出冲动行为
+- `reputation = 0`: 角色无法调动社会资源
+- 自定义触发器可以绑定到 `resource:` 前缀（如 `resource:算力 <= 20`）
+
+### 6.4 环境交互引擎 (Physical State Bus)
+
+```python
+class EnvironmentVariable:
+    name: str          # "alert_level"
+    value: float       # 当前值
+    min_val / max_val  # 范围
+    decay_rate: float  # 每章自然衰减量
+
+class EnvironmentBehaviorRule:
+    variable_name: str          # "alert_level"
+    threshold: float            # 90
+    operator: str               # ">="
+    affected_characters: list   # ["林晚晴"]
+    behavior_effect: str        # "你处于极度焦虑中，行为变得激进和冲动"
+    resource_effect: dict       # {"emotional_energy": -15}
+```
+
+环境不再只是描写——它是能影响 Agent 决策的变量。当 `alert_level >= 90` 时，林晚晴的 prompt 自动被注入焦虑/激进行为修饰；当 `compute_power <= 20` 时，陆辰的 prompt 被注入思维碎片化效果。
+
+角色的行动也可以反过来影响环境（通过 `CharacterAction.environment_change`）。
+
+### 6.5 支线观察者 (Secondary Viewpoints)
+
+```python
+class SecondaryViewpoint:
+    id: str                  # "system_log"
+    name: str                # "MindForge 系统自动日志"
+    perspective_type: str    # "system_log" | "bystander" | "surveillance" | "inner_voice"
+    voice_style: str         # "冰冷的系统语言，只记录事实和数据"
+    can_observe: list[str]   # 可观察的角色（空=全部）
+    trigger_condition: str   # "alert_level > 50"
+```
+
+**典型效果**：
+
+- 系统日志视角：`[MindForge-SYS] 03:47:12 用户林晚晴（ID:LWQ-0214）触发数据删除操作。目标：Project-Mobius-Core。警告：该操作不可逆。`
+- 路人视角：`对面楼里的住户注意到，那间公寓的窗户整夜透着诡异的蓝光，偶尔还能听到一个女人的哭声。`
+- 残留数据片段视角：碎片化的、诗意的第一人称絮语，像正在消散的意识的最后独白。
+
+### 6.6 章节评审系统 (Reviewer)
+
+单次 LLM 调用完成三项评审：
+
+```python
+class ChapterReview:
+    theme_alignment: float     # 主题契合度 0-1
+    theme_drift_notes: str     # 主题偏移备注
+    theme_progression: float   # 主题推进度
+    theme_progression_notes: str
+    tension_score: float       # 张力评分 0-1
+    pacing_notes: str          # 节奏备注
+    logic_issues: list[str]    # 逻辑漏洞
+    character_voice_issues: list  # 角色声音一致性问题
+    unresolved_threads: list   # 未回收的伏笔
+    thread_recovery_rate: float
+    unrecovered_threads: list[str]
+    chapter_necessity: float
+    chapter_necessity_notes: str
+    suggestions_for_next: str  # 对下一章的建议
+```
+
+评审结果直接影响下一章的编排——编排者会参考 `suggestions_for_next` 调整方向。
+
+### 6.7 记忆蒸馏 (Memory Distillation)
+
+从简单的"记忆压缩"升级为结构化蒸馏：
+
+```python
+class StructuredMemorySummary:
+    key_conflicts: list[str]         # 关键冲突
+    relationship_changes: list[str]  # 关系变化
+    unresolved_tensions: list[str]   # 未解决悬念
+    belief_shifts: list[str]         # 信念转变
+    resource_shifts: list[str]       # 资源变动
+    emotional_arc: str               # 情绪弧线概括
+```
+
+角色只读取"结构化摘要 + 最近 N 条原始记忆"，而非全量历史。这极大地提高了一致性并控制了 token 消耗。
+
+**state.memory 与 memory/ 文件夹的关系**：
+- `state.character_states[name].memory`：每次行动后 LLM 产出的 `new_memory` 追加而成的原始列表，用于 prompt 的「近期记忆」；会去重（完全重复或前 25 字相同则跳过）。
+- `state.character_states[name].compressed_memory`：蒸馏后的纯文本摘要，用于 prompt 的「长期记忆」。
+- `memory/chapter_X_memory.json`：蒸馏产出的结构化摘要（key_conflicts、relationship_changes 等），持久化供人工查阅；不参与角色 prompt 注入。
+
+### 6.8 失控型叙事引擎 (Chaos Engine v2.1)
+
+这是 v2.1 的核心升级，旨在从"可控叙事"转向"失控演化"，让角色真正拥有自主权，即使这种自主权会带来灾难。
+
+#### 6.8.1 结构演进
+- **v2.0**: `Desire → Plan → Action → Outcome → Belief Update`
+- **v2.1**: `Impulse → Rationalization → Flawed Action → Friction/Distortion → Unintended Consequence → Irreversible Mark → Belief Mutation`
+
+#### 6.8.2 去AI味模块 (Human Noise Layer)
+通过注入犹豫、限制抽象语言、控制诗意密度（≤ 0.2）和禁止情绪总结（强制转换为行为描写），使生成的文字更具人性。
+
+#### 6.8.3 认知偏差强制 (Cognitive Bias Engine)
+角色永远不会做最优选择。基于状态自动触发：确认偏误、情绪驱动、占有欲合理化、恐惧放大等。
+
+#### 6.8.4 不可控后果 (Chaos Propagator)
+没有行动是"干净"的。每次重大行动后有概率触发关系破裂、附带损害、信息泄露或连锁反应。
+
+#### 6.8.5 不可逆印记 (Irreversible Mark)
+每章强制产生至少一个无法修复的损伤（关系、心理或结构性），确保故事无法回到原点。
+
+#### 6.8.6 信念畸形变异 (Non-linear Belief Mutation)
+信念不再平滑变化，而是发生极端强化、歪曲、自我否认或虚无主义崩溃。
+
+#### 6.8.7 叙事压力与失控 (Stress & Loss of Control)
+系统主动计算叙事压力指数。当压力过大或情绪能量耗尽时，角色会随机触发"失控行为"（说出不该说的话、冲动破坏等）。
+
+#### 6.8.8 作者意图覆盖 (Author Intent Override)
+作者降权（权重 0.4），角色欲望升权（权重 0.6）。角色可以"背叛"导演的场景安排，拒绝执行预定剧情。
+
+#### 6.8.9 文风控制器 (Style Governor v2.2)
+这是 v2.2 的核心后处理层，用于强制文本降温：
+- **比喻限制器**: 每 1000 字最多 1 个强比喻。
+- **抽象词杀手**: 自动清理“神性、救赎、变量”等哲学词汇。
+- **普通句比例**: 强制 40% 以上的句子为无修饰的陈述句。
+- **漂亮话删减**: 自动删除最华丽的 20% 句子，增加文本骨架感。
+
+#### 6.8.10 张弛节奏引擎 (Rhythm Engine)
+基于循环状态机规划章节节奏：
+- `High Tension` (爆发) -> `Cooling` (冷却) -> `Daily` (日常) -> `Unexpected` (意外) -> `Silence` (沉默) -> `Outbreak` (再爆发)。
+- 强制要求在高密度情绪段后插入低能量段。
+
+#### 6.8.11 角色失误模块 (Human Error Engine)
+强制让角色在每 2 章犯一个非战略性错误，确保故事中存在“人的笨拙”：
+- 错误类型：误判他人、情绪失控、推理错误、选择逃避、撒谎。
+- 规则：错误必须产生真实的、不可修复的叙事后果。
+
+---
+
+## 7. 数据模型全览
+
+所有模型定义在 `src/mobius/models/` 目录下，使用 Pydantic v2。
+
+```
+models/
+├── architecture.py   # NovelBlueprint, ChapterContract, ThreadLedgerItem
+├── belief.py         # Belief（三层信念）
+├── chapter.py        # Scene, ChapterPlan, Chapter
+├── character.py      # CharacterProfile, CharacterDynamicState, CharacterAction
+├── chaos_engine.py   # v2.1 失控引擎数据模型（CognitiveBiasConfig, IrreversibleMark 等）
+├── desire.py         # Desire, Fear, DesireProposal
+├── environment.py    # EnvironmentVariable, EnvironmentBehaviorRule, EnvironmentState
+├── resource.py       # ResourcePool, ResourceCost, ResourceEvent
+├── review.py         # WorldEvent, ChapterReview(含结构指标), StructuredMemorySummary
+├── triggers.py       # TriggerRule, TriggeredEvent
+├── viewpoint.py      # SecondaryViewpoint, ViewpointFragment
+└── worldview.py      # WorldView, PlotOutline
+```
+
+**v2.1 失控引擎**：`engine/chaos_engine.py` 实现 ChaosEngine，集成 HumanNoiseInjector、CognitiveBiasProcessor、ChaosPropagator、IrreversibleMark、BeliefMutation、LossOfControl 等模块。详见章节 [6.8 失控型叙事引擎](#68-失控型叙事引擎-chaos-engine-v21)。
+
+### 关键数据流
+
+```
+CharacterProfile (静态) + CharacterDynamicState (动态)
+    │
+    ├── beliefs: list[Belief]         → 信念系统
+    ├── desires: list[Desire]         → 欲望驱动
+    ├── fears: list[Fear]             → 恐惧机制
+    ├── resources: ResourcePool       → 资源经济
+    ├── emotional_state: dict         → 情感状态
+    ├── relationship_scores: dict     → 关系图谱
+    ├── memory: list[str]             → 短期记忆
+    └── compressed_memory: str        → 长期记忆摘要
+
+CharacterAction (角色每次行动的输出)
+    │
+    ├── content: str                  → 外显行为（其他角色可见）
+    ├── internal_monologue: str       → 私有心理活动（认知黑箱）
+    ├── cognitive_dissonance: float   → 言行不一致度
+    ├── belief_change: dict           → 信念强度变化
+    ├── desire_change: dict           → 欲望优先级变化
+    ├── resource_cost: dict           → 资源消耗
+    └── environment_change: dict      → 环境变量影响
+```
+
+---
+
+## 8. Agent 全览 <a id="8-agent-all-view"></a>
+
+| Agent | 文件 | 职责 | 模型 |
+|-------|------|------|------|
+| **Series Architect** | `agents/director.py` | 生成/刷新全书蓝图（命题、章节职责、角色哲学弧线） | Gemini |
+| **Chapter Contract Planner** | `agents/director.py` | 生成章节计划并执行合同校验（失败回退重规划） | Gemini |
+| **Scene Orchestrator** | `agents/director.py` | 按场景执行路由，维护叙事因果链 | Gemini |
+| **Character (N个)** | `agents/character.py` | 双阶段生成（内心独白 + 外显行动）、欲望提案 | Gemini + M2-her |
+| **Narrator** | `agents/narrator.py` | 融合外显行为 + 潜台词 + 支线视角 → 小说正文 | Gemini |
+| **Style Governor** | `engine/style_governor.py` | 文风降温、漂亮话删减、普通句强制（后处理层） | Gemini |
+| **World Observer** | `agents/observer.py` | 评估世界事件的叙事价值，裁剪呈现 | Gemini |
+| **Secondary Viewpoints** | `agents/observer.py` | 从非主角视角生成叙事片段 | Gemini |
+| **Reviewer (Structural Reviewer)** | `agents/reviewer.py` | 主题守护 + 张力控制 + 结构一致性审查（主题推进/回收率/章节必要性） | Gemini (低温) |
+| **Memory Distiller** | `agents/memory.py` | 结构化记忆蒸馏 | Gemini |
+| **Clue Ledger** | `graph/novel_graph.py` | 章间线索结算（开线/回收/逾期）并生成下一章强约束上下文 | 本地逻辑 |
+
+### Agent 间信息隔离
+
+```
+角色 A 可见:  自己的 internal_monologue + 所有角色的 content
+角色 B 可见:  自己的 internal_monologue + 所有角色的 content
+叙事 Agent:   所有角色的 internal_monologue + content + viewpoint_fragments
+评审 Agent:   章节正文 + theme + tension_curve + 角色信念状态
+观察者:       world_events + theme + tension_curve
+```
+
+---
+
+## 9. LLM 抽象层
+
+### 9.1 多模型支持
+
+```
+src/mobius/llm/
+├── __init__.py
+└── minimax.py      # ChatMiniMax(BaseChatModel)
+```
+
+通过 LangChain 的 `BaseChatModel` 抽象，Mobius 支持：
+
+| Provider | 用途 | 封装方式 |
+|----------|------|---------|
+| Google Gemini | 主模型（导演/角色决策/叙事/评审） | `langchain-google-genai` |
+| MiniMax M2-her | 角色扮演（对话/内心活动） | 自定义 `ChatMiniMax` |
+| OpenAI | 备选 | `langchain-openai` |
+| 其他 | 通用 | `langchain.init_chat_model()` |
+
+### 9.2 MiniMax M2-her 封装
+
+`ChatMiniMax` 是一个完整的 LangChain `BaseChatModel` 实现，支持 M2-her 特有的：
+
+- `user_system` 角色（描述对话者人设）
+- `sample_message_user` / `sample_message_ai`（注入对话风格范例）
+- `with_character()` 便捷方法（为不同角色创建独立的调用者）
+
+### 9.3 差异化配置
+
+```python
+class NovelConfig:
+    director_model: ModelConfig          # 导演用的模型
+    character_model: ModelConfig          # 角色决策用的模型
+    narrator_model: ModelConfig           # 叙事用的模型
+    character_roleplay_model: ModelConfig  # 角色扮演用的模型 (M2-her)
+    reviewer_model: ModelConfig           # 评审用的模型 (建议低温)
+    observer_model: ModelConfig           # 观察者用的模型
+```
+
+每个 Agent 可以使用不同的模型、不同的 temperature，实现"思维质感差异化"。
+
+---
+
+## 10. 状态管理
+
+### 10.1 全局状态 (NovelState)
+
+LangGraph 的 `StateGraph` 使用 `TypedDict` 定义状态，所有节点共享：
+
+```python
+class NovelState(TypedDict, total=False):
+    # 设定（不变）
+    worldview, plot_outline, character_profiles, theme
+
+    # 章节管理
+    total_chapters, current_chapter_index, chapter_plan, chapter_contract, chapters
+
+    # 场景管理
+    scene_queue, current_scene
+
+    # 角色动态
+    character_states: dict[str, CharacterDynamicState]
+
+    # 场景执行
+    scene_actions: Annotated[list[CharacterAction], add]  # 累加器
+    narrative_buffer: Annotated[list[str], add]            # 累加器
+
+    # 欲望驱动
+    desire_proposals: list[DesireProposal]
+
+    # 世界模拟
+    world_events: list[WorldEvent]
+
+    # 环境
+    environment: EnvironmentState
+
+    # 支线视角
+    secondary_viewpoints, viewpoint_fragments
+
+    # 评审
+    tension_curve, chapter_reviews, memory_summaries
+
+    # 信息流与全书架构
+    revealed_information: list[str]
+    novel_blueprint: NovelBlueprint | None
+    open_threads: list[str]
+    payoff_ledger: list[ThreadLedgerItem]
+    theme_progress_log: list[str]
+
+    # 控制
+    next_action: str
+    metadata: dict
+```
+
+### 10.2 角色状态更新流
+
+```
+CharacterAction 生成
+    │
+    ▼
+apply_action_to_state()
+    ├── emotional_change    → 情感状态更新
+    ├── relationship_change → 关系图谱更新
+    ├── attribute_change    → 自定义属性更新
+    ├── belief_change       → apply_belief_change() → 施加抗变系数 → 检查固化/崩解
+    ├── desire_change       → 欲望优先级更新
+    ├── resource_cost       → apply_resource_cost() → 扣减资源
+    └── new_memory          → 添加到短期记忆
+    │
+    ▼
+decay_emotions()           → 极端情绪自然回归中性
+    │
+    ▼
+check_triggers()           → 检查触发条件（支持 belief:/fear:/resource: 前缀）
+```
+
+### 10.3 Checkpointing
+
+使用 LangGraph 的 `InMemorySaver` 实现运行时 Checkpoint。每个生成会话有唯一的 `thread_id`，支持中断恢复。
+
+---
+
+## 11. YAML 设定集规范
+
+Mobius 通过 YAML 文件接收完整的小说设定，包括：
+
+> v3.0 支持直接传入 Markdown 启动文档；系统会先自动翻译为 YAML（`output/.../bootstrap/*.preset.yaml`），再进入同一套加载逻辑。
+
+```yaml
+# 顶级结构
+worldview:           # 世界观设定 → WorldView
+plot_outline:        # 剧情大纲 → PlotOutline
+characters:          # 角色列表 → CharacterProfile + CharacterDynamicState
+  - name: "角色名"
+    role: "protagonist"
+    personality: "..."
+    initial_state:
+      emotional_state: {快乐: 0.5}
+      relationship_scores: {其他角色: 0.3}
+      beliefs:             # ← 新增
+        - id: "belief_id"
+          statement: "..."
+          layer: "core"
+          strength: 0.9
+      desires:             # ← 新增
+        - id: "desire_id"
+          description: "..."
+          priority: 0.8
+      fears:               # ← 新增
+        - id: "fear_id"
+          description: "..."
+          intensity: 0.7
+      resources:           # ← 新增
+        time: 80
+        reputation: 70
+        emotional_energy: 50
+      trigger_rules:
+        - id: "trigger_id"
+          attribute: "resource:emotional_energy"  # 支持 resource: 前缀
+          threshold: 15
+          operator: "lte"
+
+environment:         # ← 新增：环境交互引擎
+  variables:
+    alert_level:
+      value: 10
+      decay_rate: 5
+      description: "系统安全警报等级"
+  behavior_modifiers:
+    - variable_name: alert_level
+      threshold: 90
+      operator: ">="
+      affected_characters: ["林晚晴"]
+      behavior_effect: "你处于极度焦虑中..."
+
+secondary_viewpoints:  # ← 新增：支线观察者
+  - id: system_log
+    name: "MindForge 系统自动日志"
+    perspective_type: system_log
+    voice_style: "冰冷的系统语言..."
+    trigger_condition: "alert_level > 50"
+```
+
+---
+
+## 12. 项目结构
+
+```
+mobius/
+├── pyproject.toml                    # 项目配置与依赖
+├── README.md                         # 快速入门
+├── docs/
+│   ├── ARCHITECTURE.md               # 本文档
+│   └── USAGE_SPEC.md                 # 使用规范
+├── presets/                          # 设定集（原 examples/）
+│   ├── ai_love_story.yaml            # 《她的造物》完整设定集
+│   └── test_token_tracking.yaml     # Token 统计测试设定集
+├── output/                           # 生成结果输出目录
+└── src/mobius/
+    ├── __init__.py
+    ├── main.py                       # CLI 入口
+    ├── config/
+    │   └── settings.py               # ModelConfig, NovelConfig
+    ├── models/                       # Pydantic 数据模型 (12 个文件)
+    │   ├── architecture.py           # 全书蓝图/章节合同/线索账本
+    │   ├── belief.py                 # Belief（三层信念）
+    │   ├── chapter.py                # Scene, ChapterPlan, Chapter
+    │   ├── character.py              # CharacterProfile/DynamicState/Action
+    │   ├── desire.py                 # Desire, Fear, DesireProposal
+    │   ├── environment.py            # 环境变量、行为修饰
+    │   ├── resource.py               # ResourcePool, ResourceCost
+    │   ├── review.py                 # WorldEvent, ChapterReview(含结构指标)
+    │   ├── triggers.py               # TriggerRule, TriggeredEvent
+    │   ├── viewpoint.py              # SecondaryViewpoint, ViewpointFragment
+    │   ├── worldview.py              # WorldView, PlotOutline
+    │   └── chaos_engine.py           # v2.1 失控引擎数据模型
+    ├── engine/                       # 失控型叙事引擎 (1 个文件)
+    │   └── chaos_engine.py           # ChaosEngine 实现
+    ├── prompts/                      # 提示词（与代码分离）
+    │   ├── director_system.txt
+    │   ├── narrator_system.txt
+    │   ├── character_*.txt
+    │   └── ...
+    ├── output/                       # 产出物管理
+    │   └── manager.py                # OutputManager（逐章落盘 + 事件记录）
+    ├── utils/                        # 工具模块
+    │   ├── token_tracker.py          # Token 消耗统计
+    │   └── token_tracking_model.py   # LLM 包装器
+    ├── agents/                       # Agent 实现 (7 个文件)
+    │   ├── character.py              # 角色 Agent（双阶段 + 双模型 + 欲望提案）
+    │   ├── director.py               # 导演/编排者 Agent
+    │   ├── narrator.py               # 叙事 Agent（潜台词 + 支线视角融合）
+    │   ├── observer.py               # 世界观察者 + 支线视角生成
+    │   ├── reviewer.py               # 章节评审 Agent
+    │   ├── memory.py                 # 记忆蒸馏 Agent
+    │   └── utils.py                  # LLM 响应解析工具
+    ├── state/                        # 状态管理 (3 个文件)
+    │   ├── novel_state.py            # NovelState (LangGraph 全局状态)
+    │   ├── character_state.py        # 信念/资源/情感/环境评估逻辑
+    │   └── conflict_engine.py        # 冲突检测引擎
+    ├── graph/                        # LangGraph 图定义 (2 个文件)
+    │   ├── novel_graph.py            # 双循环 StateGraph + YAML 加载
+    │   └── routing.py                # 条件路由（含 blueprint_refresh/chapter_contract/clue_ledger）
+    └── llm/                          # LLM 封装层 (1 个文件)
+        └── minimax.py                # ChatMiniMax (M2-her 角色扮演)
+```
+
+**代码规模**：约 38 个 Python 源文件。
+
+---
+
+## 13. 使用方式
+
+### 13.1 安装
+
+```bash
+cd mobius
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
+
+### 13.2 环境变量
+
+```bash
+export GOOGLE_API_KEY="your-gemini-key"
+# 可选：MiniMax 角色扮演模型
+export MINIMAX_API_KEY="your-minimax-key"
+```
+
+### 13.3 运行
+
+```bash
+# 批量生成（自动激活 v2.1 失控引擎）
+mobius generate presets/ai_love_story.yaml -o output/ai_love_story
+
+# 交互模式
+mobius generate presets/ai_love_story.yaml -i -o output/ai_love_story
+
+# 详细日志 + Token 统计
+mobius generate presets/ai_love_story.yaml -v -o output/ai_love_story
+
+# 查看 Token 消耗
+cat output/ai_love_story/metadata.json | jq '.token_usage.summary'
+```
+
+### 13.4 Token 消耗统计
+
+系统通过 `utils/token_tracker.py` 和 `utils/token_tracking_model.py` 自动统计所有 LLM 调用的 token 消耗。生成结束时写入 `output/<novel_name>/metadata.json` 的 `token_usage` 字段，支持按 operation、model、chapter 维度查看。详见 [USAGE_SPEC.md](USAGE_SPEC.md)。
+
+### 13.5 自定义模型
+
+通过环境变量覆盖：
+
+```bash
+export MOBIUS_PROVIDER=openai
+export MOBIUS_MODEL=gpt-4o
+export MOBIUS_TEMPERATURE=0.7
+```
+
+或在代码中配置 `NovelConfig`：
+
+```python
+config = NovelConfig(
+    director_model=ModelConfig(provider="google", model_name="gemini-3-flash-preview"),
+    character_roleplay_model=ModelConfig(provider="minimax", model_name="M2-her"),
+    reviewer_model=ModelConfig(provider="google", temperature=0.3),
+)
+```
+
+---
+
+## 14. 扩展指南
+
+### 14.1 添加新的 Agent
+
+1. 在 `agents/` 下创建新文件，定义节点函数工厂
+2. 在 `agents/__init__.py` 中导出
+3. 在 `graph/novel_graph.py` 的 `build_novel_graph()` 中注册节点和边
+4. 在 `graph/routing.py` 的 `VALID_ACTIONS` 中注册节点名称
+
+### 14.2 添加新的数据模型
+
+1. 在 `models/` 下创建新的 Pydantic 模型文件
+2. 在 `models/__init__.py` 中导出
+3. 在 `state/novel_state.py` 的 `NovelState` 中添加新字段
+4. 在 `graph/novel_graph.py` 的 `create_initial_state()` 和 `load_setting_from_yaml()` 中处理初始化
+
+### 14.3 添加新的 LLM Provider
+
+1. 在 `llm/` 下创建新的 `BaseChatModel` 子类
+2. 在 `main.py` 的 `_init_model()` 中添加 provider 分支
+3. 在 `pyproject.toml` 中添加依赖
+
+### 14.4 添加新的环境变量
+
+只需在 YAML 设定集的 `environment.variables` 中声明：
+
+```yaml
+environment:
+  variables:
+    my_new_var:
+      value: 50
+      max_val: 100
+      description: "我的新变量"
+      decay_rate: 3
+  behavior_modifiers:
+    - variable_name: my_new_var
+      threshold: 80
+      operator: ">="
+      behavior_effect: "描述对角色的影响"
+```
+
+无需修改任何代码，系统会自动将其注入角色的上下文。
+
+### 14.5 添加新的支线视角
+
+同样只需在 YAML 中声明：
+
+```yaml
+secondary_viewpoints:
+  - id: my_viewpoint
+    name: "安保摄像头"
+    perspective_type: surveillance
+    voice_style: "黑白影像般冷漠的机械描述"
+    trigger_condition: "alert_level > 60"
+```
+
+---
+
+> **Mobius** — 不是写书工具，是叙事生态系统。  
+> 当角色可以在没有剧情推动时思考，拥有自己的长期目标，在无人观察时发生变化——  
+> 你写的不是小说，你是在养一个文明。
