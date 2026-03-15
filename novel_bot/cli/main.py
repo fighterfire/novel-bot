@@ -12,6 +12,9 @@ from novel_bot.config.settings import settings
 app = typer.Typer()
 console = Console()
 
+from novel_bot.cli.workflow import workflow_app
+app.add_typer(workflow_app, name="workflow", help="交互式创作工作流命令")
+
 def find_available_workspace(base_path: Path) -> Path:
     """查找可用的workspace名称，如果已存在则自动递增"""
     if not base_path.exists():

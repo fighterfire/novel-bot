@@ -1,84 +1,157 @@
+from typing import Optional
 from novel_bot.agent.memory import MemoryStore
 from novel_bot.agent.skills import SkillsLoader
+from novel_bot.agent.agents import AgentRole, ROLE_DESCRIPTIONS, ROLE_PERMISSIONS, ROLE_SKILLS
 from loguru import logger
 
 class ContextBuilder:
-    def __init__(self, memory_store: MemoryStore):
+    def __init__(self, memory_store: MemoryStore, role: Optional[AgentRole] = None):
         self.memory = memory_store
+        self.role = role or AgentRole.COORDINATOR
         self.skills = SkillsLoader(memory_store.workspace)
 
     def build_system_prompt(self) -> str:
-        # Load core files
-        soul = self.memory.read("SOUL.md")
-        tone = self.memory.read("TONE.md")
-        
         prompt_parts = [
             "# IDENTITY",
-            "You are an expert novel writer agent.",
-            "Your goal is to write a cohesive, engaging long-form story based on the user's instructions.",
+            f"You are a {self.role.value} agent in a novel writing system.",
+            f"Role: {ROLE_DESCRIPTIONS.get(self.role, 'Expert novel writer agent')}",
         ]
-
+        
+        prompt_parts.extend(self._build_permissions_section())
+        prompt_parts.extend(self._build_context_section())
+        prompt_parts.extend(self._build_skills_section())
+        prompt_parts.extend(self._build_instructions_section())
+        
+        return "\n".join(prompt_parts)
+    
+    def _build_permissions_section(self) -> list:
+        permissions = ROLE_PERMISSIONS.get(self.role, {})
+        read_perms = permissions.get("read", [])
+        write_perms = permissions.get("write", [])
+        tool_perms = permissions.get("tools", [])
+        
+        parts = [
+            "",
+            "# PERMISSIONS",
+            f"## Read Access: {', '.join(read_perms) if read_perms else 'All'}",
+            f"## Write Access: {', '.join(write_perms) if write_perms else 'All'}",
+            f"## Available Tools: {', '.join(tool_perms) if tool_perms else 'All'}",
+        ]
+        return parts
+    
+    def _build_context_section(self) -> list:
+        parts = []
+        
+        soul = self.memory.read("SOUL.md")
         if soul:
-            prompt_parts.append(f"\n## SOUL / PERSONA\n{soul}")
+            parts.append(f"\n## WRITING STYLE\n{soul}")
         
+        tone = self.memory.read("TONE.md")
         if tone:
-            prompt_parts.append(f"\n## WRITING TONE\n{tone}")
+            parts.append(f"\n## TONE\n{tone}")
 
-        # Static Story Context
-        chars = self.memory.read("CHARACTERS.md")
-        if chars:
-            prompt_parts.append(f"\n## CHARACTERS\n{chars}")
+        if self._can_read("CHARACTERS.md"):
+            chars = self.memory.read("CHARACTERS.md")
+            if chars:
+                parts.append(f"\n## CHARACTERS\n{chars}")
         
-        world = self.memory.read("WORLD.md")
-        if world:
-            prompt_parts.append(f"\n## WORLD SETTING\n{world}")
+        if self._can_read("WORLD.md"):
+            world = self.memory.read("WORLD.md")
+            if world:
+                parts.append(f"\n## WORLD SETTING\n{world}")
 
-        # Dynamic Context (Memory)
-        # 1. Long Term Memory (Important Facts)
-        global_mem = self.memory.read_global_memory()
-        if global_mem:
-             prompt_parts.append(f"\n## LONG TERM MEMORY (Important Facts)\n{global_mem}")
-             
-        # 2. Short Term Memory (Recent Chapters)
-        recent_chapters = self.memory.get_recent_chapters()
-        if recent_chapters:
-            prompt_parts.append(f"\n## RECENT CHAPTER SUMMARIES (Short Term Memory)\n{recent_chapters}")
+        if self._can_read("memory/"):
+            global_mem = self.memory.read_global_memory()
+            if global_mem:
+                parts.append(f"\n## LONG TERM MEMORY (Important Facts)\n{global_mem}")
+            
+            recent_chapters = self.memory.get_recent_chapters()
+            if recent_chapters:
+                parts.append(f"\n## RECENT CHAPTER SUMMARIES (Short Term Memory)\n{recent_chapters}")
 
-        # 3. Overall Story Progress (if any manual summary exists)
-        summary = self.memory.read("STORY_SUMMARY.md")
-        if summary:
-            prompt_parts.append(f"\n## STORY SO FAR\n{summary}")
-
-        # Skills - progressive loading
-        # 1. Always-loaded skills: include full content
+        if self._can_read("STORY_SUMMARY.md"):
+            summary = self.memory.read("STORY_SUMMARY.md")
+            if summary:
+                parts.append(f"\n## STORY SO FAR\n{summary}")
+        
+        return parts
+    
+    def _build_skills_section(self) -> list:
+        parts = []
+        
+        role_skills = ROLE_SKILLS.get(self.role, [])
+        if role_skills:
+            skills_content = self.skills.load_skills_for_context(role_skills)
+            if skills_content:
+                parts.append(f"\n## ROLE SKILLS\n{skills_content}")
+        
         always_skills = self.skills.get_always_skills()
         if always_skills:
             always_content = self.skills.load_skills_for_context(always_skills)
             if always_content:
-                prompt_parts.append(f"\n## ACTIVE SKILLS\n{always_content}")
+                parts.append(f"\n## ACTIVE SKILLS\n{always_content}")
         
-        # 2. Available skills: only show summary
         skills_summary = self.skills.build_skills_summary()
         if skills_summary:
-            prompt_parts.append(f"""\n## AVAILABLE SKILLS
+            parts.append(f"""\n## AVAILABLE SKILLS
 
 The following skills extend your capabilities. To use a skill, read its SKILL.md file using the read_file tool.
-Skills with available="false" need dependencies installed first.
 
 {skills_summary}""")
-
-        prompt_parts.append("\n## INSTRUCTIONS")
-        prompt_parts.append("1. Always stay in character as defined in SOUL.md")
-        prompt_parts.append("2. Maintain consistency with CHARACTERS.md and WORLD.md")
-        prompt_parts.append("3. Use the 'read_file' tool to check specific details if unsure.")
-        prompt_parts.append("4. ALWAYS save your novel chapters in the 'drafts/' directory (e.g., 'drafts/chapter_01.md').") 
-        prompt_parts.append("5. When a chapter is finished, memorize its DETAILED SUMMARY using 'memorize_chapter_event'.")
-        prompt_parts.append("   - Do NOT save the full text in memory. Save the PLOT POINTS, KEY ITEMS, and CHARACTER CHANGES.")
-        prompt_parts.append("6. **CRITICAL LONG-TERM MEMORY**: You MUST maintain 'STORY_SUMMARY.md' as a high-level plot synopsis of the ENTIRE story so far.")
-        prompt_parts.append("   - This is different from chapter summaries. It is the single source of truth for the ongoing story arc.")
-        prompt_parts.append("   - Whenever a significant event changes the story's direction, update this file using 'write_file'.")
-        prompt_parts.append("7. **AUTONOMOUS MODE**: You are capable of performing multiple actions in sequence.")
-        prompt_parts.append("   - If you have an Outline, you can proceed to Write the Chapter, then Summarize it, without asking for permission.")
-        prompt_parts.append("   - Only stop to ask the user if you are at a decision point or need creative input.")
-
-        return "\n".join(prompt_parts)
+        
+        return parts
+    
+    def _build_instructions_section(self) -> list:
+        base_instructions = [
+            "",
+            "# INSTRUCTIONS",
+            "1. Stay within your role and permissions",
+            "2. Only use tools you have access to",
+            "3. Only read/write files in your permitted directories",
+            "4. Focus on your specific task",
+        ]
+        
+        role_instructions = {
+            AgentRole.PLANNER: [
+                "5. Create detailed scene plans before writing",
+                "6. Maintain the story bible (bible/) with character and world info",
+                "7. Track plot threads, suspense, and foreshadowing",
+                "8. Update STORY_SUMMARY.md after each chapter",
+            ],
+            AgentRole.WRITER: [
+                "5. Write chapters based on scene plans",
+                "6. Save chapters to drafts/ directory",
+                "7. Follow the writing style defined in SOUL.md",
+                "8. Maintain character voices and story consistency",
+            ],
+            AgentRole.REVIEWER: [
+                "5. Review chapters using the 10-dimension checklist",
+                "6. Score each dimension from 1-5",
+                "7. Provide specific, actionable feedback",
+                "8. Output verdict: 通过 (≥35), 需修改 (25-34), 需重写 (<25)",
+            ],
+            AgentRole.POLISHER: [
+                "5. Remove AI flavor from text",
+                "6. Improve dialogue naturalness",
+                "7. Enhance descriptions and pacing",
+                "8. Maintain the author's voice",
+            ],
+            AgentRole.COORDINATOR: [
+                "5. Coordinate between specialized agents",
+                "6. Ensure quality through the review process",
+                "7. Report progress and results to the user",
+                "8. Maintain overall story coherence",
+            ],
+        }
+        
+        return base_instructions + role_instructions.get(self.role, [])
+    
+    def _can_read(self, path: str) -> bool:
+        permissions = ROLE_PERMISSIONS.get(self.role, {})
+        read_perms = permissions.get("read", [])
+        if "*" in read_perms:
+            return True
+        for pattern in read_perms:
+            if path.startswith(pattern.rstrip("/")) or path == pattern:
+                return True
+        return False

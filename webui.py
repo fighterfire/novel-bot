@@ -100,8 +100,8 @@ if "current_page" not in st.session_state:
     st.session_state["current_page"] = "首页"
 
 # 侧边栏页面选择
-page = st.sidebar.radio("选择页面", ["首页", "项目管理", "智能写作助手", "AI辅助分析"], 
-                       index=["首页", "项目管理", "智能写作助手", "AI辅助分析"].index(st.session_state["current_page"]))
+page = st.sidebar.radio("选择页面", ["首页", "项目管理", "智能写作助手", "AI辅助分析", "检查点管理"], 
+                       index=["首页", "项目管理", "智能写作助手", "AI辅助分析", "检查点管理"].index(st.session_state["current_page"]))
 
 # 更新会话状态
 if page != st.session_state["current_page"]:
@@ -372,13 +372,22 @@ elif page == "智能写作助手":
         if "agent_loop" not in st.session_state or st.session_state.get("last_workspace") != current_workspace:
             st.session_state["agent_loop"] = AgentLoop(current_workspace)
             st.session_state["last_workspace"] = current_workspace
-            # 重置消息历史
-            if "messages" in st.session_state:
-                del st.session_state["messages"]
+            # 从持久化历史加载消息
+            saved_history = st.session_state["agent_loop"].recorder.get_history(limit=50)
+            st.session_state["messages"] = [
+                {"role": msg.get("role"), "content": msg.get("content", "")} 
+                for msg in saved_history 
+                if msg.get("role") in ["user", "assistant"]
+            ]
         
         # 聊天界面
         if "messages" not in st.session_state:
             st.session_state["messages"] = []
+        
+        # 显示历史记录摘要
+        if st.session_state["messages"]:
+            history_count = len(st.session_state["messages"])
+            st.info(f"📚 已加载 {history_count} 条历史对话记录")
         
         # 显示聊天历史
         for message in st.session_state["messages"]:
@@ -1629,3 +1638,135 @@ elif page == "AI辅助分析":
                 "• **竞品分析**：分析同类型作品的优缺点\n" +
                 "• **市场预测**：预测具体题材的市场潜力\n" +
                 "• **内容生成**：基于分析结果生成小说大纲和章节内容")
+
+# 检查点管理页面
+elif page == "检查点管理":
+    st.markdown('<div class="sub-header">检查点管理</div>', unsafe_allow_html=True)
+    
+    if "current_workspace" not in st.session_state:
+        st.warning("请先从首页选择一个项目")
+    else:
+        current_workspace = st.session_state["current_workspace"]
+        
+        from novel_bot.agent.checkpoint import CheckpointManager, CheckpointConfig, CheckpointType
+        
+        if "checkpoint_manager" not in st.session_state or st.session_state.get("last_checkpoint_workspace") != current_workspace:
+            config = CheckpointConfig(
+                enabled=True,
+                require_confirmation=True,
+                auto_continue_after_seconds=0,
+            )
+            st.session_state["checkpoint_manager"] = CheckpointManager(current_workspace, config)
+            st.session_state["last_checkpoint_workspace"] = current_workspace
+        
+        checkpoint_manager = st.session_state["checkpoint_manager"]
+        
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            st.markdown("### 检查点列表")
+            
+            checkpoints = checkpoint_manager.list_checkpoints()
+            
+            if checkpoints:
+                for cp in checkpoints:
+                    with st.expander(f"**{cp['id']}** - {cp['description'] or cp['type']}"):
+                        st.markdown(f"""
+                        - **章节**: {cp['chapter_num']}
+                        - **类型**: {cp['type']}
+                        - **时间**: {cp['timestamp']}
+                        - **状态**: {'✅ 已确认' if cp['confirmed'] else '⏳ 待确认'}
+                        """)
+                        
+                        if not cp['confirmed']:
+                            col_a, col_b = st.columns(2)
+                            with col_a:
+                                if st.button("确认", key=f"confirm_{cp['id']}"):
+                                    checkpoint_manager.confirm_checkpoint(cp['id'])
+                                    st.success("已确认！")
+                                    st.rerun()
+                            with col_b:
+                                if st.button("删除", key=f"delete_{cp['id']}"):
+                                    checkpoint_manager.delete_checkpoint(cp['id'])
+                                    st.rerun()
+            else:
+                st.info("暂无检查点")
+        
+        with col2:
+            st.markdown("### 配置")
+            
+            enabled = st.checkbox("启用检查点", value=True)
+            require_confirm = st.checkbox("需要确认", value=True)
+            auto_continue = st.number_input("自动继续秒数 (0=禁用)", min_value=0, max_value=300, value=0)
+            
+            st.markdown("### 检查点类型")
+            checkpoint_types = st.multiselect(
+                "选择需要暂停的检查点类型",
+                ["after_planning", "after_review", "after_writing", "milestone"],
+                default=["after_planning", "after_review", "milestone"]
+            )
+            
+            if st.button("保存配置"):
+                st.session_state["checkpoint_manager"].config.enabled = enabled
+                st.session_state["checkpoint_manager"].config.require_confirmation = require_confirm
+                st.session_state["checkpoint_manager"].config.auto_continue_after_seconds = auto_continue
+                st.success("配置已保存！")
+            
+            st.markdown("### 统计")
+            summary = checkpoint_manager.get_bible_summary() if hasattr(checkpoint_manager, 'get_bible_summary') else {}
+            st.metric("总检查点数", len(checkpoints))
+            st.metric("待确认", len([cp for cp in checkpoints if not cp['confirmed']]))
+
+# 确认对话框组件
+def show_confirmation_dialog(title: str, message: str, checkpoint_id: str = None):
+    st.markdown("""
+    <style>
+    .confirmation-dialog {
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        background: white;
+        padding: 2rem;
+        border-radius: 10px;
+        box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+        z-index: 1000;
+        max-width: 500px;
+        width: 90%;
+    }
+    .confirmation-overlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0,0,0,0.5);
+        z-index: 999;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    st.markdown('<div class="confirmation-overlay"></div>', unsafe_allow_html=True)
+    
+    with st.container():
+        st.markdown('<div class="confirmation-dialog">', unsafe_allow_html=True)
+        st.markdown(f"### {title}")
+        st.markdown(message)
+        
+        col1, col2, col3 = st.columns([1, 1, 2])
+        
+        with col1:
+            if st.button("✅ 确认继续", key=f"dialog_confirm_{checkpoint_id}", type="primary"):
+                return "confirm"
+        
+        with col2:
+            if st.button("❌ 取消", key=f"dialog_cancel_{checkpoint_id}"):
+                return "cancel"
+        
+        with col3:
+            if st.button("⏭️ 跳过此类型", key=f"dialog_skip_{checkpoint_id}"):
+                return "skip"
+        
+        st.markdown('</div>', unsafe_allow_html=True)
+    
+    return None

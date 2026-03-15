@@ -5,11 +5,22 @@ import re
 import json
 import shutil
 from pathlib import Path
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, TYPE_CHECKING
 import yaml
 from loguru import logger
 
+if TYPE_CHECKING:
+    from novel_bot.agent.agents import AgentRole
+
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
+
+ROLE_SKILL_MAPPING = {
+    "coordinator": [],
+    "planner": ["planner-skill"],
+    "writer": ["writer-skill"],
+    "reviewer": ["reviewer-skill"],
+    "polisher": ["polisher-skill"],
+}
 
 class SkillsLoader:
     """
@@ -139,10 +150,26 @@ class SkillsLoader:
         for s in self.list_skills(filter_unavailable=True):
             meta = self.get_skill_metadata(s["name"]) or {}
             skill_meta = self._parse_nanobot_metadata(meta.get("metadata", ""))
-            # Check 'always' in both top-level and nanobot metadata
             if str(skill_meta.get("always")).lower() == "true" or str(meta.get("always")).lower() == "true":
                 result.append(s["name"])
         return result
+
+    def get_skills_for_role(self, role: "AgentRole") -> List[str]:
+        """Get skills bound to a specific agent role."""
+        role_name = role.value if hasattr(role, "value") else str(role)
+        skill_names = ROLE_SKILL_MAPPING.get(role_name, [])
+        
+        result = []
+        for name in skill_names:
+            if self.load_skill(name):
+                result.append(name)
+        
+        return result
+
+    def load_role_skills_for_context(self, role: "AgentRole") -> str:
+        """Load all skills for a role and return formatted context string."""
+        skill_names = self.get_skills_for_role(role)
+        return self.load_skills_for_context(skill_names)
 
     def get_skill_metadata(self, name: str) -> Optional[Dict]:
         """Get metadata from a skill's frontmatter."""
